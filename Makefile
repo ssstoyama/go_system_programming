@@ -1,5 +1,5 @@
-.PHONY: run
-run:
+.PHONY: serve
+serve:
 	go run tcp/server/main.go
 
 .PHONY: req

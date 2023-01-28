@@ -2,19 +2,15 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
-	"time"
 )
 
-// gzip 対応版
+// chunk 対応版
 func main() {
 	listener, err := net.Listen("tcp", "localhost:8888")
 	if err != nil {
@@ -42,14 +38,9 @@ func processSession(conn net.Conn) {
 	fmt.Printf("Accept %v\n", conn.RemoteAddr())
 	defer conn.Close()
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		request, err := http.ReadRequest(bufio.NewReader(conn))
 		if err != nil {
-			neterr, ok := err.(net.Error)
-			if ok && neterr.Timeout() {
-				fmt.Println("Timeout")
-				break
-			} else if err == io.EOF {
+			if err == io.EOF {
 				break
 			}
 			panic(err)
@@ -62,26 +53,27 @@ func processSession(conn net.Conn) {
 
 		// レスポンスを書き込む
 		// HTTP/1.1 かつ、ContentLength の設定が必要
-		response := http.Response{
-			StatusCode: http.StatusOK,
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-			Header:     make(http.Header),
+		fmt.Fprintf(conn, strings.Join([]string{
+			"HTTP/1.1 200 OK",
+			"Content-Type: text/plain",
+			"Transfer-Encoding: chunked",
+			"", "",
+		}, "\r\n"))
+		for _, content := range contents {
+			bytes := []byte(content)
+			// データサイズ(byte)とデータを返す
+			fmt.Fprintf(conn, "%x\r\n%s\r\n", len(bytes), content)
 		}
-		if isGZipAcceptable(request) {
-			content := fmt.Sprintf("%s (gzipped)\n", dump)
-			var buf bytes.Buffer
-			writer := gzip.NewWriter(&buf)
-			io.WriteString(writer, content)
-			writer.Close()
-			response.Body = ioutil.NopCloser(&buf)
-			response.ContentLength = int64(buf.Len())
-			response.Header.Set("Content-Encoding", "gzip")
-		} else {
-			content := fmt.Sprintf("%s\n", dump)
-			response.Body = ioutil.NopCloser(strings.NewReader(content))
-			response.ContentLength = int64(len(content))
-		}
-		response.Write(conn)
+		// データサイズ 0 で通信終了
+		fmt.Fprintf(conn, "0\r\n\r\n")
 	}
+}
+
+var contents = []string{
+	"これは、私わたしが小さいときに、村の茂平もへいというおじいさんからきいたお話です。",
+	"むかしは、私たちの村のちかくの、中山なかやまというところに小さなお城があって、",
+	"中山さまというおとのさまが、おられたそうです。",
+	"その中山から、少しはなれた山の中に、「ごん狐ぎつね」という狐がいました。",
+	"ごんは、一人ひとりぼっちの小狐で、しだの一ぱいしげった森の中に穴をほって住んでいました。",
+	"そして、夜でも昼でも、あたりの村へ出てきて、いたずらばかりしました。",
 }
