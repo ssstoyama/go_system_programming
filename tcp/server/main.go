@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"time"
 )
 
-// chunk 対応版
+// パイプライニング 対応版
 func main() {
 	listener, err := net.Listen("tcp", "localhost:8888")
 	if err != nil {
@@ -34,46 +36,67 @@ func isGZipAcceptable(request *http.Request) bool {
 	) != -1
 }
 
+// セッション 1 つを処理
 func processSession(conn net.Conn) {
 	fmt.Printf("Accept %v\n", conn.RemoteAddr())
-	defer conn.Close()
+	// セッション内のリクエストを順に処理するためのチャネル
+	sessionResponses := make(chan chan *http.Response, 50)
+	defer close(sessionResponses)
+	// レスポンスを直列化してソケットに書き出す専用の goroutine
+	go writeToConn(sessionResponses, conn)
+	reader := bufio.NewReader(conn)
+	// レスポンスを受け取ってセッションのキューに入れる
 	for {
-		request, err := http.ReadRequest(bufio.NewReader(conn))
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		request, err := http.ReadRequest(reader)
 		if err != nil {
-			if err == io.EOF {
+			neterr, ok := err.(net.Error)
+			if ok && neterr.Timeout() {
+				fmt.Println("Timeout")
+				break
+			} else if err == io.EOF {
 				break
 			}
 			panic(err)
 		}
-		dump, err := httputil.DumpRequest(request, true)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(string(dump))
-
-		// レスポンスを書き込む
-		// HTTP/1.1 かつ、ContentLength の設定が必要
-		fmt.Fprintf(conn, strings.Join([]string{
-			"HTTP/1.1 200 OK",
-			"Content-Type: text/plain",
-			"Transfer-Encoding: chunked",
-			"", "",
-		}, "\r\n"))
-		for _, content := range contents {
-			bytes := []byte(content)
-			// データサイズ(byte)とデータを返す
-			fmt.Fprintf(conn, "%x\r\n%s\r\n", len(bytes), content)
-		}
-		// データサイズ 0 で通信終了
-		fmt.Fprintf(conn, "0\r\n\r\n")
+		sessionResponse := make(chan *http.Response)
+		sessionResponses <- sessionResponse
+		// 非同期で実行
+		go handleRequest(request, sessionResponse)
 	}
 }
 
-var contents = []string{
-	"これは、私わたしが小さいときに、村の茂平もへいというおじいさんからきいたお話です。",
-	"むかしは、私たちの村のちかくの、中山なかやまというところに小さなお城があって、",
-	"中山さまというおとのさまが、おられたそうです。",
-	"その中山から、少しはなれた山の中に、「ごん狐ぎつね」という狐がいました。",
-	"ごんは、一人ひとりぼっちの小狐で、しだの一ぱいしげった森の中に穴をほって住んでいました。",
-	"そして、夜でも昼でも、あたりの村へ出てきて、いたずらばかりしました。",
+func writeToConn(sessionResponses chan chan *http.Response, conn net.Conn) {
+	defer conn.Close()
+	for sessionResponse := range sessionResponses {
+		response := <-sessionResponse
+		response.Write(conn)
+		close(sessionResponse)
+	}
+}
+
+func handleRequest(request *http.Request, resultReceiver chan *http.Response) {
+	dump, err := httputil.DumpRequest(request, true)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(dump))
+	var content string
+	if message := request.URL.Query().Get("message"); message != "" {
+		content = fmt.Sprintf("%s\n", message)
+	} else {
+		content = "Hello World\n"
+	}
+	// レスポンスを書き込む
+	// セッションを維持するために Keep-Alive でないといけない
+	response := &http.Response{
+		StatusCode:    200,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		ContentLength: int64(len(content)),
+		Body:          ioutil.NopCloser(strings.NewReader(content)),
+	}
+	// 処理が終わったらチャネルに書き込み、
+	// ブロックされていた writeToConn の処理を再始動する
+	resultReceiver <- response
 }
